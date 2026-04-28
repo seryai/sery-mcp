@@ -30,7 +30,7 @@
 //! filesystem call. Tools are read-only by design — no `write_file`,
 //! no `delete`, no `execute`.
 
-#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.2")]
+#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.3")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Pedantic lints we deliberately accept:
 //   * doc_markdown — prose mentions SQL keywords, library names, and
@@ -408,12 +408,9 @@ impl SeryMcpServer {
                 .and_then(|s| s.to_str())
                 .map(str::to_lowercase)
                 .unwrap_or_default();
-            let relative = entry
-                .path
-                .strip_prefix(&self.root)
-                .unwrap_or(&entry.path)
-                .to_string_lossy()
-                .to_lowercase();
+            let relative_path =
+                path_to_forward_slash(entry.path.strip_prefix(&self.root).unwrap_or(&entry.path));
+            let relative_lower = relative_path.to_lowercase();
 
             let (score, why) = if stem == query || basename == query {
                 (1.0, "exact basename match")
@@ -421,19 +418,14 @@ impl SeryMcpServer {
                 (0.8, "basename starts with query")
             } else if basename.contains(&query) {
                 (0.5, "basename contains query")
-            } else if relative.contains(&query) {
+            } else if relative_lower.contains(&query) {
                 (0.2, "path contains query")
             } else {
                 continue;
             };
 
             hits.push(SearchHit {
-                relative_path: entry
-                    .path
-                    .strip_prefix(&self.root)
-                    .unwrap_or(&entry.path)
-                    .to_string_lossy()
-                    .into_owned(),
+                relative_path,
                 size_bytes: entry.size_bytes,
                 extension: entry.extension,
                 score,
@@ -778,12 +770,8 @@ impl SeryMcpServer {
                 break;
             }
             let Ok(entry) = result else { continue };
-            let relative = entry
-                .path
-                .strip_prefix(&self.root)
-                .unwrap_or(&entry.path)
-                .to_string_lossy()
-                .into_owned();
+            let relative =
+                path_to_forward_slash(entry.path.strip_prefix(&self.root).unwrap_or(&entry.path));
             out.push(FileEntry {
                 relative_path: relative,
                 size_bytes: entry.size_bytes,
@@ -842,7 +830,13 @@ impl ServerHandler for SeryMcpServer {
 /// anchors. Cheaper + safer than `canonicalize()` (no symlink TOCTOU).
 fn validate_relative_components(raw: &str) -> Result<(), McpError> {
     let p = Path::new(raw);
-    if p.is_absolute() {
+    // `Path::is_absolute()` is platform-aware: on Windows it only
+    // returns true for `C:\...` / UNC. We additionally reject leading
+    // `/` and `\` on every platform so a Unix-style absolute path
+    // like `/etc/passwd` can't sneak through on Windows (where
+    // is_absolute() would say false but the path still escapes the
+    // configured `--root` semantically).
+    if p.is_absolute() || raw.starts_with('/') || raw.starts_with('\\') {
         return Err(McpError::invalid_params(
             "'path' must be relative to --root (no absolute paths)",
             None,
@@ -857,8 +851,12 @@ fn validate_relative_components(raw: &str) -> Result<(), McpError> {
                 ));
             }
             Component::Prefix(_) | Component::RootDir => {
+                // Reachable on Windows when the input is a drive
+                // prefix like `C:\Foo` — Path::is_absolute() returns
+                // true so the earlier branch fires first; this arm
+                // is defensive against future Component variants.
                 return Err(McpError::invalid_params(
-                    "'path' must be relative (no drive prefixes or root anchors)",
+                    "'path' must be relative to --root (no absolute paths)",
                     None,
                 ));
             }
@@ -866,6 +864,27 @@ fn validate_relative_components(raw: &str) -> Result<(), McpError> {
         }
     }
     Ok(())
+}
+
+/// Convert a `Path` (possibly Windows-flavoured with `\`) to a
+/// forward-slash string.
+///
+/// All MCP-facing paths use `/` regardless of host platform. The LLM
+/// should see the same shape in every tool result, so a Windows host
+/// returning `data\finance\sales.csv` would (a) confuse cross-
+/// platform LLM prompts and (b) break round-tripping when the LLM
+/// passes the path back into a tool that does substring matching.
+/// Normalising at the output boundary keeps the contract simple.
+///
+/// Input parsing (PathBuf::join) handles either separator on Windows
+/// already, so we don't need a corresponding normalise on the way in.
+fn path_to_forward_slash(path: &Path) -> String {
+    let s = path.to_string_lossy().into_owned();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
 }
 
 /// Lowercase, dot-less file extension. Empty string when the file

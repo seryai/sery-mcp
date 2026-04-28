@@ -11,6 +11,35 @@ do.
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-04-28
+
+### Fixed — two Windows-specific bugs surfaced by CI
+
+**1. `/etc/passwd` wasn't rejected on Windows.** `Path::is_absolute()`
+is platform-aware: on Windows it only returns true for `C:\...` /
+UNC, so a Unix-style absolute path like `/etc/passwd` slipped past
+the early reject in `validate_relative_components`. The
+`Component::RootDir` arm fired with a different error message
+("root anchors") that the test (and likely an LLM's error
+handler) wouldn't recognise. Now we additionally reject any
+leading `/` or `\` on every platform.
+
+**2. Output paths on Windows used backslashes.** `path.to_string_lossy()`
+returns native separators — `data\finance\sales.csv` on Windows.
+The LLM expects `/` everywhere (round-trip works, cross-platform
+prompts don't break). Added a `path_to_forward_slash()` helper
+applied to every MCP-facing `relative_path` in `list_folder` and
+`search_files`. Input parsing is unchanged because `PathBuf::join`
+already accepts either separator on Windows.
+
+### Notes
+
+- Tests now pass on `windows-latest` in CI alongside Ubuntu and
+  macOS.
+- Path inputs (`get_schema(path=…)`, etc.) keep accepting either
+  separator. Outputs always use `/`. Round-trip: pass back what
+  `list_folder` returned, it just works.
+
 ## [0.4.2] — 2026-04-28
 
 ### Fixed — Windows linker error
