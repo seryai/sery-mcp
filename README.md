@@ -2,7 +2,7 @@
 
 **The local-files MCP server. Pure Rust. Free your Claude Desktop / Cursor / Zed / Continue from the upload-to-cloud dance.**
 
-> **Status:** pre-0.1 bootstrap. The repo is scaffolded; MCP handshake + first tools land in v0.1.0. ⏳
+> **Status:** v0.2.0 — five tools shipped (`list_folder`, `search_files`, `get_schema`, `sample_rows`, `read_document`). `query_sql` lands in v0.3.0.
 
 `sery-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the data-heavy files on your machine — CSVs,
@@ -28,7 +28,7 @@ composes three open-source crates we already publish:
 Plus ~500 lines of MCP glue on top of [`rmcp`](https://crates.io/crates/rmcp), the official Anthropic
 Rust SDK.
 
-## Quick start (planned for v0.1.0)
+## Quick start
 
 ```bash
 cargo install sery-mcp
@@ -49,16 +49,23 @@ Then point your MCP client at it. Example for Claude Desktop's `mcp.json`:
 
 Restart your MCP client and the tools below show up in its tool palette.
 
-## Planned tool surface
+## Tool surface
+
+### Shipped in v0.2.0
 
 | Tool | What it does | Backed by |
 |---|---|---|
-| `list_folder` | Enumerate files under a folder, with size + mtime + extension | `scankit` |
-| `search_files` | Find files by name + extension, ranked | `scankit` + lightweight scoring |
-| `get_schema` | Return column names + types + row count for a tabular file | `tabkit` |
-| `query_sql` | Run a SQL query against a local tabular file | Pure-Rust SQL engine (DataFusion / Polars — TBD in v0.1) |
-| `read_document` | Convert a document to markdown for the LLM to read | `mdkit` |
-| `sample_rows` | Return N sample rows from a tabular file (PII-redacted) | `tabkit` |
+| `list_folder` | Enumerate files under `--root` (or a sub-path) with size + mtime + extension | `scankit` |
+| `search_files` | Case-insensitive filename search with ranking (exact 1.0 → path-substring 0.2). Optional extension filter. | `scankit` + scoring |
+| `get_schema` | Column names + inferred types + row count for any tabular file (CSV / TSV / Parquet / XLSX / XLS / XLSB / XLSM / ODS) | `tabkit` |
+| `sample_rows` | First N rows of a tabular file as header-keyed JSON objects (default 5, capped at 100) | `tabkit` |
+| `read_document` | DOCX / PDF / PPTX / HTML / IPYNB / EPUB / RTF / ODT → markdown. 50 MB cap. | `mdkit` (libpdfium / pandoc / html2md) |
+
+### Coming in v0.3.0
+
+| Tool | What it does | Backed by |
+|---|---|---|
+| `query_sql` | Read-only SQL queries against a single tabular file | Pure-Rust SQL engine (`DataFusion`) |
 
 Tools are **read-only** by design. There is no `write_file`, no
 `execute_command`, no `delete`. The privacy story is that a bug in
@@ -93,13 +100,15 @@ the LLM (or in your prompt) cannot lose your data.
 │                       │ tool calls               │
 │                       ▼                          │
 │  ┌─────────────────────────────────────────┐    │
-│  │  Tools                                  │    │
+│  │  Tools (v0.2.0)                         │    │
 │  │  ├─ list_folder    →  scankit           │    │
 │  │  ├─ search_files   →  scankit           │    │
 │  │  ├─ get_schema     →  tabkit            │    │
-│  │  ├─ query_sql      →  pure-Rust SQL     │    │
-│  │  ├─ read_document  →  mdkit             │    │
-│  │  └─ sample_rows    →  tabkit            │    │
+│  │  ├─ sample_rows    →  tabkit            │    │
+│  │  └─ read_document  →  mdkit             │    │
+│  │                                         │    │
+│  │  v0.3.0:                                │    │
+│  │     query_sql      →  DataFusion        │    │
 │  └─────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────┘
                      │ filesystem reads
