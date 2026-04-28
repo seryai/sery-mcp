@@ -2,7 +2,7 @@
 
 **The local-files MCP server. Pure Rust. Free your Claude Desktop / Cursor / Zed / Continue from the upload-to-cloud dance.**
 
-> **Status:** v0.2.0 — five tools shipped (`list_folder`, `search_files`, `get_schema`, `sample_rows`, `read_document`). `query_sql` lands in v0.3.0.
+> **Status:** v0.3.0 — all six planned tools shipped: `list_folder`, `search_files`, `get_schema`, `sample_rows`, `read_document`, `query_sql`.
 
 `sery-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the data-heavy files on your machine — CSVs,
@@ -49,9 +49,7 @@ Then point your MCP client at it. Example for Claude Desktop's `mcp.json`:
 
 Restart your MCP client and the tools below show up in its tool palette.
 
-## Tool surface
-
-### Shipped in v0.2.0
+## Tool surface (v0.3.0 — feature-complete)
 
 | Tool | What it does | Backed by |
 |---|---|---|
@@ -60,16 +58,12 @@ Restart your MCP client and the tools below show up in its tool palette.
 | `get_schema` | Column names + inferred types + row count for any tabular file (CSV / TSV / Parquet / XLSX / XLS / XLSB / XLSM / ODS) | `tabkit` |
 | `sample_rows` | First N rows of a tabular file as header-keyed JSON objects (default 5, capped at 100) | `tabkit` |
 | `read_document` | DOCX / PDF / PPTX / HTML / IPYNB / EPUB / RTF / ODT → markdown. 50 MB cap. | `mdkit` (libpdfium / pandoc / html2md) |
-
-### Coming in v0.3.0
-
-| Tool | What it does | Backed by |
-|---|---|---|
-| `query_sql` | Read-only SQL queries against a single tabular file | Pure-Rust SQL engine (`DataFusion`) |
+| `query_sql` | Read-only SQL on a CSV / TSV / Parquet file. The file is registered as table `data` for the duration of the call. Row cap default 100, max 1000. | `DataFusion` |
 
 Tools are **read-only** by design. There is no `write_file`, no
-`execute_command`, no `delete`. The privacy story is that a bug in
-the LLM (or in your prompt) cannot lose your data.
+`execute_command`, no `delete`. `query_sql` rejects INSERT / UPDATE
+/ DELETE / DDL at SQL parse time. The privacy story is that a bug
+in the LLM (or in your prompt) cannot lose your data.
 
 ## What `sery-mcp` deliberately doesn't do
 
@@ -100,15 +94,13 @@ the LLM (or in your prompt) cannot lose your data.
 │                       │ tool calls               │
 │                       ▼                          │
 │  ┌─────────────────────────────────────────┐    │
-│  │  Tools (v0.2.0)                         │    │
+│  │  Tools (v0.3.0 — feature-complete)      │    │
 │  │  ├─ list_folder    →  scankit           │    │
 │  │  ├─ search_files   →  scankit           │    │
 │  │  ├─ get_schema     →  tabkit            │    │
 │  │  ├─ sample_rows    →  tabkit            │    │
-│  │  └─ read_document  →  mdkit             │    │
-│  │                                         │    │
-│  │  v0.3.0:                                │    │
-│  │     query_sql      →  DataFusion        │    │
+│  │  ├─ read_document  →  mdkit             │    │
+│  │  └─ query_sql      →  DataFusion        │    │
 │  └─────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────┘
                      │ filesystem reads

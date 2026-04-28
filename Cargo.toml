@@ -1,6 +1,6 @@
 [package]
 name = "sery-mcp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # 1.88 because mdkit transitively pulls in libloading 0.9 (via
 # pdfium-render) which sets rust-version = "1.88". Same floor as the
@@ -82,6 +82,17 @@ clap = { version = "4.5", features = ["derive"] }
 # is already in the kit-family transitive deps via mdkit/tabkit; the
 # direct dep makes the format function discoverable here.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# DataFusion — pure-Rust SQL engine, Apache 2.0. Backs the query_sql
+# tool (v0.3+). We use the default features which include sql,
+# parquet, datetime + string + nested expressions, and compression.
+# DataFusion's MSRV (1.88) matches ours so no version-floor friction.
+#
+# Why DataFusion over Polars: DataFusion is purpose-built for SQL on
+# Arrow; Polars treats SQL as a secondary surface on top of its
+# DataFrame API. For our case (LLM passes us SQL, we run it once,
+# return rows) DataFusion is the cleaner fit.
+datafusion = "53"
 
 [dev-dependencies]
 tempfile = "3"

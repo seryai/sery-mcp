@@ -11,6 +11,73 @@ do.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-28
+
+### Added — `query_sql` (the v0.3 headline tool)
+
+- **`query_sql`** — read-only SQL queries against a CSV / TSV /
+  Parquet file. The file is registered as table `data` for the
+  duration of the call; the LLM writes
+  `SELECT name FROM data WHERE amount > 100`, not a path-templated
+  query. Backed by [DataFusion](https://crates.io/crates/datafusion)
+  53 (pure Rust, Apache 2.0).
+- **Default row cap of 100, max 1000.** Use SQL `LIMIT` for tighter
+  caps. The response carries a `truncated: bool` field so the LLM
+  can detect when it should refine the query.
+- **Format dispatch**: CSV (default delimiter), TSV (tab delimiter),
+  Parquet. XLSX/XLS aren't supported by `query_sql` — use
+  `get_schema` + `sample_rows` for those, or convert to Parquet
+  first via `tabkit`.
+- **Read-only by design**: DataFusion's `SessionContext` exposes no
+  `CREATE EXTERNAL TABLE` against arbitrary files when no DDL
+  statements are submitted; we never call `execute_logical_plan` on
+  user input. `INSERT` / `UPDATE` / `DELETE` / `DDL` are rejected
+  at SQL parse time.
+- **Arrow → JSON** conversion handles all common types: int / uint
+  (8/16/32/64), float (32/64), bool, utf8, large utf8, date32 /
+  date64 (ISO 8601), timestamp (sec / ms / μs / ns, ISO 8601
+  RFC 3339). Decimals / lists / structs / dictionaries fall through
+  to Arrow's `ArrayFormatter` so we don't panic on schemas we didn't
+  explicitly map.
+
+### Added — supporting infrastructure
+
+- **`datafusion = "53"`** added as a direct dep. Default features
+  cover SQL + Parquet + datetime / string / nested expressions +
+  compression. ~5 MB compiled.
+- **`QuerySqlRequest` + `QueryResponse`** types exported on the
+  library surface for downstream embedders that want to share
+  shapes with the LLM client.
+- **4 new unit tests** (18 total): `query_sql_csv_happy_path`,
+  `query_sql_truncates_at_limit` (verifies the +1 lookahead row
+  detection), `query_sql_rejects_unsupported_format`,
+  `query_sql_surfaces_sql_parse_errors`.
+
+### Changed
+
+- Server `instructions` enumerate all six tools and call out
+  `query_sql`'s `data` table convention.
+- Module-level docs reorganised around the v0.3 surface
+  (six tools, no more "TBD" entries).
+
+### Verified
+
+- `cargo build --release` clean.
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo fmt --check` clean.
+- 18 unit tests pass (4 new for `query_sql`).
+- Live smoke test: `tools/list` returns all six tools with full
+  JSON schemas.
+
+### v0.3 is feature-complete
+
+All six tools from the original roadmap now ship:
+`list_folder`, `search_files`, `get_schema`, `sample_rows`,
+`read_document`, `query_sql`. Future minor versions will focus on
+hardening (timestamp precision edge cases in DataFusion, better
+SQL error messages, optional PII redaction in `sample_rows`) rather
+than new tools.
+
 ## [0.2.0] — 2026-04-28
 
 ### Added — four new tools (read-only)

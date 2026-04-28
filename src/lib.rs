@@ -7,18 +7,20 @@
 //! (e.g. Sery Link's desktop app spawning the logic in-process
 //! instead of as a subprocess).
 //!
-//! ## v0.2.0 surface
+//! ## v0.3.0 surface
 //!
 //! - [`SeryMcpServer`] — the configured MCP server. Construct via
 //!   [`SeryMcpServer::new`] with a single `--root` path; serve with
 //!   [`rmcp::ServiceExt::serve`] and your transport of choice.
-//! - **Five tools**, all read-only:
+//! - **Six tools**, all read-only:
 //!   - `list_folder` — enumerate files (scankit)
 //!   - `search_files` — filename + extension search with scoring (scankit)
 //!   - `get_schema` — column names + types + row count (tabkit)
 //!   - `sample_rows` — N rows of sampled data, header-keyed (tabkit)
 //!   - `read_document` — DOCX/PDF/PPTX/HTML/IPYNB → markdown (mdkit)
-//! - `query_sql` is the v0.3.0 surface (`DataFusion` integration).
+//!   - `query_sql` — read-only SQL queries against a CSV / Parquet
+//!     file (`DataFusion`). The file is registered as table `data`
+//!     for the duration of the call.
 //!
 //! ## Privacy + threat model
 //!
@@ -28,7 +30,7 @@
 //! filesystem call. Tools are read-only by design — no `write_file`,
 //! no `delete`, no `execute`.
 
-#![doc(html_root_url = "https://docs.rs/sery-mcp/0.2.0")]
+#![doc(html_root_url = "https://docs.rs/sery-mcp/0.3.0")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::path::{Component, Path, PathBuf};
@@ -148,6 +150,28 @@ pub struct ReadDocumentRequest {
     pub path: String,
 }
 
+/// Input for the `query_sql` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct QuerySqlRequest {
+    /// Path to a CSV or Parquet file under `--root`.
+    #[schemars(
+        description = "Relative path to a CSV / TSV / Parquet file under --root. The file is registered as table `data` for the duration of this query."
+    )]
+    pub path: String,
+    /// The SQL query. Reference the registered file as `data`,
+    /// e.g. `SELECT * FROM data WHERE amount > 100`.
+    #[schemars(
+        description = "SQL query (DataFusion dialect, ANSI-compatible). Reference the registered file as table `data`. Read-only — no INSERT/UPDATE/DELETE/DDL support."
+    )]
+    pub sql: String,
+    /// Cap on returned rows. Defaults to 100; capped at 1000.
+    #[serde(default)]
+    #[schemars(
+        description = "Maximum rows to return. Defaults to 100, capped at 1000. Use SQL LIMIT for tighter caps."
+    )]
+    pub limit: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Tool output shapes
 // ---------------------------------------------------------------------------
@@ -241,6 +265,26 @@ pub struct DocumentResponse {
     pub char_count: usize,
     /// Source file size in bytes.
     pub size_bytes: u64,
+}
+
+/// `query_sql` response.
+#[derive(Debug, serde::Serialize)]
+pub struct QueryResponse {
+    /// The path the caller passed in.
+    pub relative_path: String,
+    /// Lowercase extension of the queried file.
+    pub format: String,
+    /// Result column names in the order they appear in the projection.
+    pub columns: Vec<String>,
+    /// Result rows as JSON objects keyed by column name.
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Number of rows returned (after the row cap).
+    pub row_count: usize,
+    /// `true` when the result was capped by the row limit and the
+    /// underlying query produced more rows. The LLM should use this
+    /// to decide whether to refine the SQL with a tighter `WHERE`
+    /// or `LIMIT`.
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +489,104 @@ impl SeryMcpServer {
     }
 
     #[tool(
+        description = "Run a read-only SQL query against a CSV or Parquet file. The file is registered as table `data` for the duration of the call — write `SELECT * FROM data WHERE amount > 100` (not the file path). Backed by DataFusion. Returns header-keyed JSON rows; row count capped at 1000 (default 100) — use SQL LIMIT or `limit` arg for tighter caps. Read-only by design — INSERT/UPDATE/DELETE/DDL are rejected."
+    )]
+    async fn query_sql(
+        &self,
+        Parameters(req): Parameters<QuerySqlRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = self.resolve_required_file(&req.path)?;
+        let format = extension_of(&path);
+        let limit = req.limit.unwrap_or(100).min(1000);
+
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| McpError::invalid_params("path is not valid UTF-8", None))?;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        match format.as_str() {
+            "csv" | "tsv" => {
+                let mut options = datafusion::prelude::CsvReadOptions::new();
+                if format == "tsv" {
+                    options = options.delimiter(b'\t');
+                }
+                ctx.register_csv("data", path_str, options)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("register csv: {e}"), None))?;
+            }
+            "parquet" => {
+                ctx.register_parquet(
+                    "data",
+                    path_str,
+                    datafusion::prelude::ParquetReadOptions::default(),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(format!("register parquet: {e}"), None))?;
+            }
+            other => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "query_sql supports csv / tsv / parquet only — got '{other}'. \
+                         Use get_schema or sample_rows for XLSX/ODS files."
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        // Ask DataFusion for one extra row so we can detect truncation
+        // without scanning the whole batch list afterwards.
+        let dataframe = ctx
+            .sql(&req.sql)
+            .await
+            .map_err(|e| McpError::invalid_params(format!("sql parse / plan: {e}"), None))?
+            .limit(0, Some(limit + 1))
+            .map_err(|e| McpError::internal_error(format!("apply limit: {e}"), None))?;
+
+        let columns: Vec<String> = dataframe
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let batches = dataframe
+            .collect()
+            .await
+            .map_err(|e| McpError::invalid_params(format!("sql execute: {e}"), None))?;
+
+        let mut rows = Vec::with_capacity(limit);
+        let mut truncated = false;
+        'outer: for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                if rows.len() == limit {
+                    truncated = true;
+                    break 'outer;
+                }
+                let mut obj = serde_json::Map::with_capacity(columns.len());
+                for (col_idx, col_name) in columns.iter().enumerate() {
+                    let array = batch.column(col_idx);
+                    obj.insert(
+                        col_name.clone(),
+                        arrow_value_to_json(array.as_ref(), row_idx),
+                    );
+                }
+                rows.push(obj);
+            }
+        }
+
+        let response = QueryResponse {
+            relative_path: req.path,
+            format,
+            row_count: rows.len(),
+            columns,
+            rows,
+            truncated,
+        };
+        as_json_result(&response)
+    }
+
+    #[tool(
         description = "Convert a document file (DOCX / PDF / PPTX / HTML / IPYNB / EPUB / RTF / ODT) to markdown. Backed by mdkit (libpdfium for PDF, pandoc for office formats, html2md for HTML). 50 MB file size cap; larger files return an error. Returns the full extracted text — pair with a chunk-aware caller if your LLM context window can't hold the whole document."
     )]
     fn read_document(
@@ -572,9 +714,11 @@ impl ServerHandler for SeryMcpServer {
             .with_instructions(
                 "sery-mcp exposes the local files under the configured --root as MCP tools. \
                  All tools are read-only. Path arguments are validated to fall under --root \
-                 (no .. escape, no absolute paths). v0.2 ships: list_folder, search_files, \
-                 get_schema, sample_rows, read_document. v0.3 will add query_sql via \
-                 DataFusion. See https://github.com/seryai/sery-mcp."
+                 (no .. escape, no absolute paths). v0.3 ships six tools: list_folder, \
+                 search_files, get_schema, sample_rows, read_document (DOCX/PDF/PPTX/HTML/IPYNB \
+                 → markdown), and query_sql (DataFusion-backed SQL on CSV/Parquet — file is \
+                 registered as table `data` for the duration of the call). \
+                 See https://github.com/seryai/sery-mcp."
                     .to_string(),
             )
     }
@@ -651,6 +795,159 @@ fn value_to_json(v: &tabkit::Value) -> serde_json::Value {
         // Covers `Null` plus any future `#[non_exhaustive]` additions
         // — all map cleanly to JSON null.
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Convert one cell of an Arrow array to a JSON value.
+///
+/// Numeric / boolean types map to native JSON. Date / timestamp
+/// types serialise as ISO 8601 strings (`DataFusion`'s default
+/// format), since that round-trips cleanly through MCP / JSON / the
+/// LLM. Anything we don't recognise downgrades to its `Display`
+/// representation as a JSON string — keeps `query_sql` resilient
+/// to `DataFusion` adding new types in minor versions.
+#[allow(clippy::too_many_lines)] // exhaustive type-match by design — splitting harms readability
+fn arrow_value_to_json(
+    array: &dyn datafusion::arrow::array::Array,
+    row: usize,
+) -> serde_json::Value {
+    use datafusion::arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, Int8Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
+    };
+    use datafusion::arrow::datatypes::DataType;
+
+    if array.is_null(row) {
+        return serde_json::Value::Null;
+    }
+
+    macro_rules! number {
+        ($arr:ty) => {{
+            let typed = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .expect("downcast matches the matched DataType");
+            serde_json::json!(typed.value(row))
+        }};
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("BooleanArray");
+            serde_json::Value::Bool(typed.value(row))
+        }
+        DataType::Int8 => number!(Int8Array),
+        DataType::Int16 => number!(Int16Array),
+        DataType::Int32 => number!(Int32Array),
+        DataType::Int64 => number!(Int64Array),
+        DataType::UInt8 => number!(UInt8Array),
+        DataType::UInt16 => number!(UInt16Array),
+        DataType::UInt32 => number!(UInt32Array),
+        DataType::UInt64 => number!(UInt64Array),
+        DataType::Float32 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("Float32Array");
+            serde_json::Number::from_f64(f64::from(typed.value(row)))
+                .map_or(serde_json::Value::Null, serde_json::Value::Number)
+        }
+        DataType::Float64 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64Array");
+            serde_json::Number::from_f64(typed.value(row))
+                .map_or(serde_json::Value::Null, serde_json::Value::Number)
+        }
+        DataType::Utf8 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("StringArray");
+            serde_json::Value::String(typed.value(row).to_string())
+        }
+        DataType::LargeUtf8 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeStringArray");
+            serde_json::Value::String(typed.value(row).to_string())
+        }
+        DataType::Date32 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32Array");
+            typed
+                .value_as_date(row)
+                .map_or(serde_json::Value::Null, |d| {
+                    serde_json::Value::String(d.format("%Y-%m-%d").to_string())
+                })
+        }
+        DataType::Date64 => {
+            let typed = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("Date64Array");
+            typed
+                .value_as_date(row)
+                .map_or(serde_json::Value::Null, |d| {
+                    serde_json::Value::String(d.format("%Y-%m-%d").to_string())
+                })
+        }
+        DataType::Timestamp(_, _) => {
+            // Cover all four precision variants by trying the most
+            // common first. DataFusion CSV/Parquet readers emit
+            // microsecond timestamps by default.
+            if let Some(typed) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                return typed
+                    .value_as_datetime(row)
+                    .map_or(serde_json::Value::Null, |d| {
+                        serde_json::Value::String(d.and_utc().to_rfc3339())
+                    });
+            }
+            if let Some(typed) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                return typed
+                    .value_as_datetime(row)
+                    .map_or(serde_json::Value::Null, |d| {
+                        serde_json::Value::String(d.and_utc().to_rfc3339())
+                    });
+            }
+            if let Some(typed) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                return typed
+                    .value_as_datetime(row)
+                    .map_or(serde_json::Value::Null, |d| {
+                        serde_json::Value::String(d.and_utc().to_rfc3339())
+                    });
+            }
+            if let Some(typed) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+                return typed
+                    .value_as_datetime(row)
+                    .map_or(serde_json::Value::Null, |d| {
+                        serde_json::Value::String(d.and_utc().to_rfc3339())
+                    });
+            }
+            serde_json::Value::String(format!("(unsupported timestamp at row {row})"))
+        }
+        // For decimals, lists, structs, dictionaries, etc. — fall back
+        // to DataFusion's `pretty_format_value`-style display rather
+        // than panicking. Keeps query_sql resilient to schemas we
+        // didn't anticipate.
+        _ => {
+            use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+            ArrayFormatter::try_new(array, &FormatOptions::default()).map_or_else(
+                |_| {
+                    serde_json::Value::String(format!("(unrenderable {} value)", array.data_type()))
+                },
+                |fmt| serde_json::Value::String(fmt.value(row).to_string()),
+            )
+        }
     }
 }
 
@@ -860,6 +1157,90 @@ mod tests {
         assert_eq!(hits[0].extension, "csv");
     }
 
+    // ── query_sql (DataFusion) ──
+
+    #[tokio::test]
+    async fn query_sql_csv_happy_path() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("sales.csv"),
+            "id,name,amount\n1,alice,100\n2,bob,250\n3,eve,50\n",
+        )
+        .unwrap();
+        let server = make_server(dir.path());
+        let result = server
+            .query_sql(Parameters(QuerySqlRequest {
+                path: "sales.csv".into(),
+                sql: "SELECT name, amount FROM data WHERE amount > 75 ORDER BY amount".into(),
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let payload = result_text(&result);
+        let parsed: QueryResponseDe = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed.format, "csv");
+        assert_eq!(parsed.columns, vec!["name", "amount"]);
+        assert_eq!(parsed.row_count, 2);
+        assert!(!parsed.truncated);
+        assert_eq!(parsed.rows[0].get("name").unwrap().as_str(), Some("alice"));
+        assert_eq!(parsed.rows[1].get("name").unwrap().as_str(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn query_sql_truncates_at_limit() {
+        use std::fmt::Write as _;
+        let dir = TempDir::new().unwrap();
+        let mut csv = String::from("n\n");
+        for i in 0..20 {
+            writeln!(csv, "{i}").unwrap();
+        }
+        fs::write(dir.path().join("nums.csv"), csv).unwrap();
+        let server = make_server(dir.path());
+        let result = server
+            .query_sql(Parameters(QuerySqlRequest {
+                path: "nums.csv".into(),
+                sql: "SELECT n FROM data".into(),
+                limit: Some(5),
+            }))
+            .await
+            .unwrap();
+        let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(parsed.row_count, 5);
+        assert!(parsed.truncated);
+    }
+
+    #[tokio::test]
+    async fn query_sql_rejects_unsupported_format() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("notes.txt"), "hi").unwrap();
+        let server = make_server(dir.path());
+        let err = server
+            .query_sql(Parameters(QuerySqlRequest {
+                path: "notes.txt".into(),
+                sql: "SELECT 1".into(),
+                limit: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("csv / tsv / parquet"));
+    }
+
+    #[tokio::test]
+    async fn query_sql_surfaces_sql_parse_errors() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+        let server = make_server(dir.path());
+        let err = server
+            .query_sql(Parameters(QuerySqlRequest {
+                path: "a.csv".into(),
+                sql: "SELEKT * FROM data".into(),
+                limit: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").to_lowercase().contains("sql"));
+    }
+
     #[test]
     fn search_files_rejects_empty_query() {
         let dir = TempDir::new().unwrap();
@@ -932,5 +1313,16 @@ mod tests {
         score: f64,
         #[allow(dead_code)]
         why_matched: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct QueryResponseDe {
+        #[allow(dead_code)]
+        relative_path: String,
+        format: String,
+        columns: Vec<String>,
+        rows: Vec<serde_json::Map<String, serde_json::Value>>,
+        row_count: usize,
+        truncated: bool,
     }
 }
