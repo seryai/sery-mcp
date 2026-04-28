@@ -11,23 +11,80 @@ do.
 
 ## [Unreleased]
 
-### Added
-- Initial repo skeleton: dual MIT/Apache 2.0 license, Cargo manifest
-  pinning [`rmcp`](https://crates.io/crates/rmcp) (the official
-  Anthropic Rust SDK for Model Context Protocol) plus the Sery kit
+## [0.1.0] — 2026-04-28
+
+### Added — first working MCP server
+- **Real MCP handshake** over rmcp's stdio transport. Clients
+  (Claude Desktop, Cursor, Zed, Continue, …) get the standard
+  initialize → tools/list → tools/call flow.
+- **`list_folder` tool** — first end-to-end tool. Walks the
+  configured `--root` (or a sub-path) via `scankit::Scanner` and
+  returns one JSON object per file with `relative_path`,
+  `size_bytes`, `modified` (RFC 3339), and lowercase `extension`.
+  Read-only by design.
+- **Path-traversal hardening** — `list_folder`'s `path` argument is
+  validated to fall under `--root` before any filesystem call.
+  Absolute paths, `..` segments, drive prefixes, and root anchors
+  are rejected up-front with `invalid_params` errors. We
+  deliberately don't `canonicalize()` here — that's TOCTOU-prone on
+  symlinks; component checks are simpler and safer.
+- **Correct `serverInfo` identity** — manually constructs
+  `Implementation` from `CARGO_PKG_*` env vars instead of calling
+  rmcp's `Implementation::from_build_env()`, which bakes in rmcp's
+  own crate name + version. Clients now see
+  `serverInfo.name = "sery-mcp"`, with description and homepage URL
+  populated from the manifest.
+- **`SeryMcpServer::new(root)`** — public constructor for downstream
+  embedding (Sery Link will eventually spawn the same logic
+  in-process instead of as a subprocess).
+- **`FileEntry`, `ListFolderRequest`** types exported for
+  downstream consumers building their own dispatch on top of the
+  same tool surface.
+- **7 unit tests** covering subpath resolution (defaults, absolute
+  rejection, `..` rejection, relative join) and `walk_entries`
+  behaviour (entries emitted, limit respected, extension
+  lowercased).
+
+### Bootstrap (carried over from pre-0.1)
+- Dual-licensed under MIT OR Apache-2.0.
+- Cargo manifest pinning `rmcp` 1.5 (the official Anthropic Rust
+  SDK), `scankit` 0.3, `tabkit` 0.4, `mdkit` 0.7.
+- CI workflow on Ubuntu / macOS / Windows (stable Rust + MSRV 1.88
+  + clippy + rustfmt + cargo-audit).
+
+### Quick start
+
+Once installed via `cargo install sery-mcp`, point your MCP client
+at it. Claude Desktop's `mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "sery": {
+      "command": "sery-mcp",
+      "args": ["--root", "/Users/me/Documents"]
+    }
+  }
+}
+```
+
+Restart the client and ask: *"List the files in my Documents
+folder."* The LLM will call `list_folder` and stream the result.
+
+### Coming in v0.2.0
+- `get_schema` (tabular files → column names + types) via `tabkit`
+- `read_document` (DOCX / PDF / HTML / IPYNB → markdown) via `mdkit`
+- `search_files` (filename + extension search with ranking)
+
+## [0.0.1] — 2026-04-28
+
+### Added — initial bootstrap
+- Repo skeleton: dual MIT/Apache 2.0 license, Cargo manifest
+  pinning [`rmcp`](https://crates.io/crates/rmcp) plus the Sery kit
   family ([`scankit`](https://crates.io/crates/scankit),
   [`tabkit`](https://crates.io/crates/tabkit),
-  [`mdkit`](https://crates.io/crates/mdkit)) as the file-extraction
-  backends.
-- Placeholder binary entrypoint that prints the build banner and exits
-  cleanly. The MCP handshake + tool implementations land in v0.1.0.
-- README explaining what `sery-mcp` is, where it fits in the Sery
-  family (`sery-link` desktop app, kit-family infrastructure, this
-  MCP bridge), and the planned tool surface.
-- CI workflow mirroring the kit-family template (clippy + rustfmt +
-  cargo-audit on Ubuntu / macOS / Windows, stable Rust + MSRV).
-
-### Notes
-- The first published release will be `0.1.0` once the MCP handshake
-  + at least one working tool (`list_folder`) ship end-to-end. The
-  bootstrap commits aren't published to crates.io.
+  [`mdkit`](https://crates.io/crates/mdkit)).
+- Placeholder binary that printed the build banner and exited
+  cleanly. Useful only for verifying the dep graph + license files.
+- README, CI workflow, this CHANGELOG.
+- **Not recommended for use** — superseded by 0.1.0 hours later.

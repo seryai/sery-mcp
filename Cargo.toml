@@ -1,6 +1,6 @@
 [package]
 name = "sery-mcp"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 # 1.88 because mdkit transitively pulls in libloading 0.9 (via
 # pdfium-render) which sets rust-version = "1.88". Same floor as the
@@ -33,11 +33,17 @@ path = "src/lib.rs"
 [dependencies]
 # rmcp — the official Anthropic Rust SDK for Model Context Protocol.
 # Pinned to ^1.5 because v1.x marks the post-1.0 stable surface; minor
-# bumps are additive per the SDK's own SemVer policy. Default features
-# (base64, macros, server) cover the stdio server case we need; the
-# `client`, `auth`, and `reqwest` features stay off so we don't drag in
-# HTTP machinery for a stdio-only binary.
-rmcp = "1.5"
+# bumps are additive per the SDK's own SemVer policy.
+#
+# Features:
+#   * `server` (default) — server-side trait + macros + schemars.
+#   * `macros` (default) — `#[tool]`, `#[tool_router]`, `#[tool_handler]`.
+#   * `transport-io` — the `stdio()` transport our binary serves over.
+#     NOT in the default set, so we opt in explicitly.
+#
+# `client`, `auth`, and `reqwest-*` features stay off so we don't
+# drag in HTTP machinery for a stdio-only binary.
+rmcp = { version = "1.5", features = ["transport-io"] }
 
 # Sery kit family — the file-extraction backends. See the README's
 # architecture diagram for which tool wires to which kit.
@@ -71,6 +77,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI parsing. clap is the obvious choice; the "derive" feature is
 # enough — we only need a handful of flags (--root, --version, etc.).
 clap = { version = "4.5", features = ["derive"] }
+
+# Timestamp formatting (ISO 8601 / RFC 3339) for tool output. chrono
+# is already in the kit-family transitive deps via mdkit/tabkit; the
+# direct dep makes the format function discoverable here.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [dev-dependencies]
 tempfile = "3"
