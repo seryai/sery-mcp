@@ -1,6 +1,6 @@
 [package]
 name = "sery-mcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # 1.88 because mdkit transitively pulls in libloading 0.9 (via
 # pdfium-render) which sets rust-version = "1.88". Same floor as the
@@ -83,18 +83,14 @@ clap = { version = "4.5", features = ["derive"] }
 # direct dep makes the format function discoverable here.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
-# DuckDB — the SQL engine that backs query_sql (v0.4+). We swapped
-# from DataFusion in v0.4.0 because the actual product use cases need
-# multi-file JOINs, smart CSV sniffing, glob patterns, window
-# functions, and native XLSX support — DuckDB does these out of the
-# box; DataFusion is catching up but isn't there yet.
+# Embedded SQL engine that backs query_sql. The `bundled` feature
+# vendors the C++ source via crates.io rather than depending on a
+# system install — larger compile, but a single static binary
+# everywhere with no runtime SQL-engine dependency to install.
 #
-# `bundled` feature pins the libduckdb C++ source, builds it from
-# crates.io rather than depending on a system install. Larger compile
-# but predictable behaviour everywhere.
-#
-# Same version sery-link pins so the kit family + cloud chat all
-# target one DuckDB dialect.
+# Multi-file JOINs, glob reads (`*.csv`), smart CSV sniffing, window
+# functions, CTEs, native XLSX — feature-rich enough that we don't
+# have to re-implement any of the SQL surface ourselves.
 duckdb = { version = "1.1", features = ["bundled"] }
 
 [dev-dependencies]

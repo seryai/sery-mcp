@@ -30,7 +30,7 @@
 //! filesystem call. Tools are read-only by design — no `write_file`,
 //! no `delete`, no `execute`.
 
-#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.1")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Pedantic lints we deliberately accept:
 //   * doc_markdown — prose mentions SQL keywords, library names, and
@@ -170,9 +170,10 @@ pub struct ReadDocumentRequest {
 /// **Multi-file mode**: pass `tables` mapping LLM-chosen names → relative paths,
 /// then JOIN them in `sql`. Mutually exclusive — pick one shape per call.
 ///
-/// Glob patterns (`*`, `?`, `[...]`) are supported in both modes — DuckDB
-/// expands them at read time. They stay bounded by `--root` because the
-/// path validator rejects `..` and absolute paths up-front.
+/// Glob patterns (`*`, `?`, `[...]`) are supported in both modes — the
+/// SQL backend expands them at read time. They stay bounded by
+/// `--root` because the path validator rejects `..` and absolute
+/// paths up-front.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct QuerySqlRequest {
     /// Single-file shortcut. Registered as table `data`.
@@ -182,7 +183,7 @@ pub struct QuerySqlRequest {
     )]
     pub path: Option<String>,
     /// Multi-file mode: map of table name → relative path (or glob).
-    /// Each entry is registered as a SQL table in the same DuckDB
+    /// Each entry is registered as a SQL table in the same query
     /// session so the LLM can JOIN across files.
     #[serde(default)]
     #[schemars(
@@ -191,7 +192,7 @@ pub struct QuerySqlRequest {
     pub tables: Option<std::collections::HashMap<String, String>>,
     /// The SQL query.
     #[schemars(
-        description = "SQL query (DuckDB dialect — supports window functions, CTEs, glob reads, JOINs across the registered tables). Read-only — INSERT/UPDATE/DELETE/DDL/ATTACH/COPY/PRAGMA all rejected at validation time."
+        description = "SQL query — supports window functions, CTEs, glob reads, JOINs across the registered tables. Read-only — INSERT/UPDATE/DELETE/DDL/ATTACH/COPY/PRAGMA all rejected at validation time."
     )]
     pub sql: String,
     /// Cap on returned rows. Defaults to 100; capped at 1000.
@@ -525,8 +526,8 @@ impl SeryMcpServer {
         description = "Run a read-only SQL query against one or more CSV / TSV / Parquet files. \
                        Single-file: pass `path`, reference as table `data` in your SQL. \
                        Multi-file: pass `tables` (a {name: path} map), reference each name as a SQL table — lets you JOIN across files. \
-                       Glob patterns (`*`, `?`) are supported in both — DuckDB expands them at read time. \
-                       Backed by DuckDB (full dialect: window functions, CTEs, smart CSV sniffing, native XLSX). \
+                       Glob patterns (`*`, `?`) are supported in both — expanded at read time. \
+                       Full SQL dialect: window functions, CTEs, smart CSV sniffing, native XLSX. \
                        Read-only by design — INSERT/UPDATE/DELETE/DDL/ATTACH/COPY/PRAGMA are rejected at validation time. \
                        Returns header-keyed JSON rows; capped at 1000 (default 100). Set `truncated: true` when more rows exist."
     )]
@@ -539,7 +540,7 @@ impl SeryMcpServer {
         validate_query_sql(&req.sql)?;
 
         let conn = duckdb::Connection::open_in_memory()
-            .map_err(|e| McpError::internal_error(format!("duckdb open: {e}"), None))?;
+            .map_err(|e| McpError::internal_error(format!("sql backend open: {e}"), None))?;
 
         // Register each (name, path) as a SQL view in the session.
         // CREATE OR REPLACE VIEW <name> AS SELECT * FROM read_csv_auto / read_parquet
@@ -552,7 +553,7 @@ impl SeryMcpServer {
 
         // Wrap in an outer LIMIT for truncation detection. We ask for
         // limit+1 rows; if we hit limit, set truncated=true and drop the
-        // extra. This is cheap because DuckDB's optimiser pushes the
+        // extra. This is cheap because the SQL planner pushes the
         // limit down past the user's projection.
         let wrapped_sql = format!("SELECT * FROM ({}) LIMIT {}", req.sql, limit + 1);
 
@@ -562,8 +563,8 @@ impl SeryMcpServer {
 
         // `query_arrow` calls `execute` internally; we read column
         // names from its schema rather than from `stmt.column_names()`
-        // (which panics on this duckdb-rs version when the prepared
-        // statement hasn't been executed yet).
+        // (which panics on this version of the binding when the
+        // prepared statement hasn't been executed yet).
         let arrow_iter = stmt
             .query_arrow(duckdb::params![])
             .map_err(|e| McpError::invalid_params(format!("sql execute: {e}"), None))?;
@@ -674,8 +675,8 @@ impl SeryMcpServer {
     }
 
     /// Resolve a path that may be a regular file OR a glob pattern
-    /// (`*`, `?`, `[...]`). Used by `query_sql`, where DuckDB does
-    /// its own glob expansion at read time.
+    /// (`*`, `?`, `[...]`). Used by `query_sql`, where the SQL
+    /// backend does its own glob expansion at read time.
     fn resolve_required_path_or_glob(&self, sub: &str) -> Result<PathBuf, McpError> {
         if sub.is_empty() {
             return Err(McpError::invalid_params("path must not be empty", None));
@@ -684,8 +685,8 @@ impl SeryMcpServer {
         let joined = self.root.join(sub);
         if !is_glob_pattern(sub) {
             // Non-glob: enforce file-exists up-front so the LLM gets
-            // a clean error instead of DuckDB's "no files" message
-            // buried inside a SQL error.
+            // a clean error instead of "no files" buried inside a
+            // SQL execution error from the backend.
             let metadata = std::fs::metadata(&joined)
                 .map_err(|e| McpError::invalid_params(format!("path not readable: {e}"), None))?;
             if !metadata.is_file() {
@@ -700,7 +701,7 @@ impl SeryMcpServer {
 
     /// Translate the `path` / `tables` fields of a [`QuerySqlRequest`]
     /// into a normalised list of [`TableSpec`]s ready to register
-    /// with DuckDB. Enforces:
+    /// with the SQL backend. Enforces:
     ///
     /// - Exactly one of `path` / `tables` is set.
     /// - At least one table.
@@ -907,10 +908,10 @@ fn value_to_json(v: &tabkit::Value) -> serde_json::Value {
     }
 }
 
-/// One file registered as a SQL table inside the DuckDB session
-/// `query_sql` opens. `table` is what the LLM uses in its SQL;
-/// `path_for_sql` is the absolute filesystem path (or glob) we
-/// interpolate into DuckDB's `read_csv_auto` / `read_parquet`.
+/// One file registered as a SQL table inside the session `query_sql`
+/// opens. `table` is what the LLM uses in its SQL; `path_for_sql` is
+/// the absolute filesystem path (or glob) we interpolate into the
+/// backend's `read_csv_auto` / `read_parquet` calls.
 #[derive(Debug)]
 struct TableSpec {
     table: String,
@@ -928,7 +929,7 @@ struct TableSpec {
 /// a forbidden keyword as a string value (`WHERE name = 'INSERT'`);
 /// the LLM can reword in those rare cases. False negatives — which
 /// would be security holes — aren't possible because every
-/// dangerous DuckDB statement starts with one of these keywords.
+/// dangerous SQL statement starts with one of these keywords.
 fn validate_query_sql(sql: &str) -> Result<(), McpError> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -984,8 +985,8 @@ fn validate_query_sql(sql: &str) -> Result<(), McpError> {
 }
 
 /// Build the `CREATE OR REPLACE VIEW <table> AS SELECT * FROM
-/// read_csv_auto(...) / read_parquet(...)` setup statement DuckDB
-/// runs to register a file as a queryable table.
+/// read_csv_auto(...) / read_parquet(...)` setup statement the SQL
+/// backend runs to register a file as a queryable table.
 fn build_register_view(table: &str, path_for_sql: &str, format: &str) -> Result<String, McpError> {
     let escaped_path = sql_string_literal(path_for_sql);
     let read_call = match format {
@@ -1023,8 +1024,8 @@ fn describe_input(specs: &[TableSpec]) -> String {
         .join(", ")
 }
 
-/// Detect `query_sql` glob patterns. DuckDB supports `*`, `**`, `?`,
-/// and `[...]`.
+/// Detect `query_sql` glob patterns. The SQL backend supports `*`,
+/// `**`, `?`, and `[...]`.
 fn is_glob_pattern(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
@@ -1062,24 +1063,23 @@ fn format_for_query_sql(path: &str) -> Result<&'static str, McpError> {
     }
 }
 
-/// Escape a string for use inside a DuckDB single-quoted SQL string
-/// literal: doubles every embedded `'`. Used for filesystem paths
-/// that might contain quotes (legal on macOS/Linux, rare in practice).
+/// Escape a string for use inside a single-quoted SQL string literal:
+/// doubles every embedded `'`. Used for filesystem paths that might
+/// contain quotes (legal on macOS/Linux, rare in practice).
 fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Convert one cell of an Arrow array to a JSON value.
 ///
-/// DuckDB's Arrow output uses the `arrow` crate types as
-/// `DataFusion` / `polars` — the same matching code works against
-/// any of them once you import from the right namespace. Numeric /
-/// boolean types map to native JSON. Date / timestamp types
-/// serialise as ISO 8601 strings (round-trips cleanly through MCP /
-/// JSON / the LLM). Anything we don't recognise downgrades to its
-/// `Display` representation via Arrow's `ArrayFormatter` — keeps
-/// `query_sql` resilient to DuckDB returning new types in minor
-/// versions.
+/// The SQL backend's Arrow output uses the standard `arrow` crate
+/// types — the same matching code works against any Arrow-emitting
+/// engine. Numeric / boolean types map to native JSON. Date /
+/// timestamp types serialise as ISO 8601 strings (round-trips
+/// cleanly through MCP / JSON / the LLM). Anything we don't recognise
+/// downgrades to its `Display` representation via Arrow's
+/// `ArrayFormatter` — keeps `query_sql` resilient to the backend
+/// returning new types in minor versions.
 #[allow(clippy::too_many_lines)] // exhaustive type-match by design — splitting harms readability
 fn arrow_value_to_json(array: &dyn duckdb::arrow::array::Array, row: usize) -> serde_json::Value {
     use duckdb::arrow::array::{
@@ -1173,11 +1173,12 @@ fn arrow_value_to_json(array: &dyn duckdb::arrow::array::Array, row: usize) -> s
                 })
         }
         DataType::Decimal128(_, scale) => {
-            // DuckDB SUM/AVG of integer columns returns HUGEINT,
-            // which Arrow encodes as Decimal128(38, 0). For
-            // scale-0 values that fit in i64, emit a JSON number
-            // so the LLM gets `100` (not `"100"`). Larger or
-            // non-zero-scale values fall through to a string.
+            // SUM/AVG of integer columns returns HUGEINT (a 128-bit
+            // integer), which Arrow encodes as Decimal128(38, 0). For
+            // scale-0 values that fit in i64, emit a JSON number so
+            // the LLM gets `100` (not `"100"`). Larger or non-zero-
+            // scale values fall through to a string preserving full
+            // precision.
             let typed = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
@@ -1450,7 +1451,7 @@ mod tests {
         assert_eq!(hits[0].extension, "csv");
     }
 
-    // ── query_sql (DuckDB) ──
+    // ── query_sql ──
 
     fn query_req(
         path: Option<&str>,

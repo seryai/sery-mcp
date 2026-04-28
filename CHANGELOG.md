@@ -11,18 +11,30 @@ do.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-28
+
+### Changed — docs polish
+
+Docs / CHANGELOG / lib.rs prose now reference the SQL backend by
+function (embedded SQL engine, smart CSV sniffing, multi-file
+JOINs, glob reads) rather than by product name. The dependency
+graph on crates.io is unchanged; this is an editing pass only.
+
+No code or API changes — straight 0.4.0 → 0.4.1 patch bump.
+
 ## [0.4.0] — 2026-04-28
 
-### Changed — `query_sql` now backed by DuckDB
+### Changed — `query_sql` switched to a richer SQL backend
 
-The DataFusion backend (v0.3.0) covered the simple "one file, one
-query" case but couldn't handle the use cases sery-link's marketing
-site actually sells: multi-file JOINs (e.g. customer × order tables),
-glob patterns over folders (`2024/*.csv`), smart CSV sniffing on
-messy real-world exports, window functions for trends, native XLSX.
+The previous backend covered the simple "one file, one query" case
+but couldn't handle the use cases that real desktop apps need:
+multi-file JOINs (e.g. customer × order tables), glob patterns over
+folders (`2024/*.csv`), smart CSV sniffing on messy real-world
+exports, window functions for trends, native XLSX.
 
-Migrated to DuckDB to match what sery-link uses for its tunnel-based
-SQL execution. Same dialect across local stdio MCP and cloud chat.
+Switched to a feature-richer embedded SQL engine that ships with the
+binary. Same dialect across local stdio MCP and any cloud transport
+that proxies through the same code path.
 
 ### Added — multi-file `query_sql`
 
@@ -30,12 +42,12 @@ SQL execution. Same dialect across local stdio MCP and cloud chat.
   multiple files as named SQL tables and JOIN across them. Each name
   must be a valid SQL identifier; cap of 16 tables per call.
 - **Glob patterns** (`*`, `**`, `?`, `[...]`) supported in both
-  single-file `path` mode and multi-file `tables` mode. DuckDB
+  single-file `path` mode and multi-file `tables` mode — the engine
   expands them at read time. Patterns stay bounded by `--root` —
   the path validator still rejects `..` and absolute paths.
-- **DuckDB `Decimal128` handling** for `SUM` / `AVG` results that
-  arrive as HUGEINT. Scale-0 values that fit in `i64` emit as JSON
-  numbers; larger values fall through to string preserving precision.
+- **HUGEINT / Decimal128 handling** for `SUM` / `AVG` results.
+  Scale-0 values that fit in `i64` emit as JSON numbers; larger
+  values fall through to string preserving precision.
 
 ### Added — read-only safety net
 
@@ -50,13 +62,7 @@ Even with `--root` sandboxing, paranoid SQL validation:
   literal string values (`WHERE name = 'INSERT'`) — LLM can reword.
 - Path strings are escaped before interpolation into
   `read_csv_auto('...')` / `read_parquet('...')` calls (single-quotes
-  doubled per DuckDB's literal escape rules).
-
-### Removed
-
-- **DataFusion dep** — gone. Cargo.lock drops ~5 MB of compiled
-  Arrow + DataFusion code; DuckDB carries its own (smaller) Arrow
-  surface via `duckdb::arrow`.
+  doubled per the engine's literal escape rules).
 
 ### Tests
 
@@ -76,11 +82,11 @@ argument is still accepted, the file is still registered as table
 Standalone v0.3 binary users won't notice; LLMs see a slightly
 different field name in tool results.
 
-`query_sql` is now **synchronous** internally (DuckDB's API is sync;
-async wasn't buying us anything in the stdio-one-client-at-a-time
-model). The tool method dropped its `async` keyword. Callers that
-embed `SeryMcpServer::query_sql` directly need to drop their
-`.await`.
+`query_sql` is now **synchronous** internally (the new SQL backend's
+API is sync; async wasn't buying us anything in the
+stdio-one-client-at-a-time model). The tool method dropped its
+`async` keyword. Callers that embed `SeryMcpServer::query_sql`
+directly need to drop their `.await`.
 
 ## [0.3.0] — 2026-04-28
 
