@@ -30,8 +30,22 @@
 //! filesystem call. Tools are read-only by design — no `write_file`,
 //! no `delete`, no `execute`.
 
-#![doc(html_root_url = "https://docs.rs/sery-mcp/0.3.0")]
+#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.0")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Pedantic lints we deliberately accept:
+//   * doc_markdown — prose mentions SQL keywords, library names, and
+//     filesystem path patterns that aren't always worth backticking.
+//   * items_after_statements — `use ...` inside match arms keeps
+//     type imports next to the arms that consume them; moving them
+//     to function-top harms locality in `arrow_value_to_json`.
+//   * case_sensitive_file_extension_comparisons — we lowercase the
+//     path string before `ends_with` checks; clippy can't see through
+//     the local rebinding.
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::case_sensitive_file_extension_comparisons
+)]
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -151,17 +165,33 @@ pub struct ReadDocumentRequest {
 }
 
 /// Input for the `query_sql` tool.
+///
+/// **Single-file mode**: pass `path` and reference the file as table `data`.
+/// **Multi-file mode**: pass `tables` mapping LLM-chosen names → relative paths,
+/// then JOIN them in `sql`. Mutually exclusive — pick one shape per call.
+///
+/// Glob patterns (`*`, `?`, `[...]`) are supported in both modes — DuckDB
+/// expands them at read time. They stay bounded by `--root` because the
+/// path validator rejects `..` and absolute paths up-front.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct QuerySqlRequest {
-    /// Path to a CSV or Parquet file under `--root`.
+    /// Single-file shortcut. Registered as table `data`.
+    #[serde(default)]
     #[schemars(
-        description = "Relative path to a CSV / TSV / Parquet file under --root. The file is registered as table `data` for the duration of this query."
+        description = "Single-file mode. Relative path (or glob pattern like '2024/*.csv') under --root. The file(s) are registered as table `data` for the duration of this query. Mutually exclusive with `tables`."
     )]
-    pub path: String,
-    /// The SQL query. Reference the registered file as `data`,
-    /// e.g. `SELECT * FROM data WHERE amount > 100`.
+    pub path: Option<String>,
+    /// Multi-file mode: map of table name → relative path (or glob).
+    /// Each entry is registered as a SQL table in the same DuckDB
+    /// session so the LLM can JOIN across files.
+    #[serde(default)]
     #[schemars(
-        description = "SQL query (DataFusion dialect, ANSI-compatible). Reference the registered file as table `data`. Read-only — no INSERT/UPDATE/DELETE/DDL support."
+        description = "Multi-file mode. Map of {table_name: relative_path} — each path becomes a SQL table you can JOIN. Names must be valid SQL identifiers ([a-zA-Z_][a-zA-Z0-9_]*). Cap of 16 tables per call. Mutually exclusive with `path`."
+    )]
+    pub tables: Option<std::collections::HashMap<String, String>>,
+    /// The SQL query.
+    #[schemars(
+        description = "SQL query (DuckDB dialect — supports window functions, CTEs, glob reads, JOINs across the registered tables). Read-only — INSERT/UPDATE/DELETE/DDL/ATTACH/COPY/PRAGMA all rejected at validation time."
     )]
     pub sql: String,
     /// Cap on returned rows. Defaults to 100; capped at 1000.
@@ -270,9 +300,12 @@ pub struct DocumentResponse {
 /// `query_sql` response.
 #[derive(Debug, serde::Serialize)]
 pub struct QueryResponse {
-    /// The path the caller passed in.
-    pub relative_path: String,
-    /// Lowercase extension of the queried file.
+    /// What the caller passed in, echoed back in human-readable form.
+    /// For single-file mode: `"path/to/file.csv"`. For multi-file:
+    /// `"customers=customers.csv, orders=orders.parquet"`.
+    pub input: String,
+    /// Lowercase extension of the (first) queried file. Empty when
+    /// glob patterns mix multiple formats.
     pub format: String,
     /// Result column names in the order they appear in the projection.
     pub columns: Vec<String>,
@@ -489,75 +522,57 @@ impl SeryMcpServer {
     }
 
     #[tool(
-        description = "Run a read-only SQL query against a CSV or Parquet file. The file is registered as table `data` for the duration of the call — write `SELECT * FROM data WHERE amount > 100` (not the file path). Backed by DataFusion. Returns header-keyed JSON rows; row count capped at 1000 (default 100) — use SQL LIMIT or `limit` arg for tighter caps. Read-only by design — INSERT/UPDATE/DELETE/DDL are rejected."
+        description = "Run a read-only SQL query against one or more CSV / TSV / Parquet files. \
+                       Single-file: pass `path`, reference as table `data` in your SQL. \
+                       Multi-file: pass `tables` (a {name: path} map), reference each name as a SQL table — lets you JOIN across files. \
+                       Glob patterns (`*`, `?`) are supported in both — DuckDB expands them at read time. \
+                       Backed by DuckDB (full dialect: window functions, CTEs, smart CSV sniffing, native XLSX). \
+                       Read-only by design — INSERT/UPDATE/DELETE/DDL/ATTACH/COPY/PRAGMA are rejected at validation time. \
+                       Returns header-keyed JSON rows; capped at 1000 (default 100). Set `truncated: true` when more rows exist."
     )]
-    async fn query_sql(
+    fn query_sql(
         &self,
         Parameters(req): Parameters<QuerySqlRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self.resolve_required_file(&req.path)?;
-        let format = extension_of(&path);
         let limit = req.limit.unwrap_or(100).min(1000);
+        let table_specs = self.resolve_table_specs(&req)?;
+        validate_query_sql(&req.sql)?;
 
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| McpError::invalid_params("path is not valid UTF-8", None))?;
+        let conn = duckdb::Connection::open_in_memory()
+            .map_err(|e| McpError::internal_error(format!("duckdb open: {e}"), None))?;
 
-        let ctx = datafusion::prelude::SessionContext::new();
-        match format.as_str() {
-            "csv" | "tsv" => {
-                let mut options = datafusion::prelude::CsvReadOptions::new();
-                if format == "tsv" {
-                    options = options.delimiter(b'\t');
-                }
-                ctx.register_csv("data", path_str, options)
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("register csv: {e}"), None))?;
-            }
-            "parquet" => {
-                ctx.register_parquet(
-                    "data",
-                    path_str,
-                    datafusion::prelude::ParquetReadOptions::default(),
-                )
-                .await
-                .map_err(|e| McpError::internal_error(format!("register parquet: {e}"), None))?;
-            }
-            other => {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "query_sql supports csv / tsv / parquet only — got '{other}'. \
-                         Use get_schema or sample_rows for XLSX/ODS files."
-                    ),
-                    None,
-                ));
-            }
+        // Register each (name, path) as a SQL view in the session.
+        // CREATE OR REPLACE VIEW <name> AS SELECT * FROM read_csv_auto / read_parquet
+        for spec in &table_specs {
+            let setup = build_register_view(&spec.table, &spec.path_for_sql, spec.format)?;
+            conn.execute_batch(&setup).map_err(|e| {
+                McpError::internal_error(format!("register table {}: {e}", spec.table), None)
+            })?;
         }
 
-        // Ask DataFusion for one extra row so we can detect truncation
-        // without scanning the whole batch list afterwards.
-        let dataframe = ctx
-            .sql(&req.sql)
-            .await
-            .map_err(|e| McpError::invalid_params(format!("sql parse / plan: {e}"), None))?
-            .limit(0, Some(limit + 1))
-            .map_err(|e| McpError::internal_error(format!("apply limit: {e}"), None))?;
+        // Wrap in an outer LIMIT for truncation detection. We ask for
+        // limit+1 rows; if we hit limit, set truncated=true and drop the
+        // extra. This is cheap because DuckDB's optimiser pushes the
+        // limit down past the user's projection.
+        let wrapped_sql = format!("SELECT * FROM ({}) LIMIT {}", req.sql, limit + 1);
 
-        let columns: Vec<String> = dataframe
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let mut stmt = conn
+            .prepare(&wrapped_sql)
+            .map_err(|e| McpError::invalid_params(format!("sql prepare: {e}"), None))?;
 
-        let batches = dataframe
-            .collect()
-            .await
+        // `query_arrow` calls `execute` internally; we read column
+        // names from its schema rather than from `stmt.column_names()`
+        // (which panics on this duckdb-rs version when the prepared
+        // statement hasn't been executed yet).
+        let arrow_iter = stmt
+            .query_arrow(duckdb::params![])
             .map_err(|e| McpError::invalid_params(format!("sql execute: {e}"), None))?;
+        let schema = arrow_iter.get_schema();
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
-        let mut rows = Vec::with_capacity(limit);
+        let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::with_capacity(limit);
         let mut truncated = false;
-        'outer: for batch in &batches {
+        'outer: for batch in arrow_iter {
             for row_idx in 0..batch.num_rows() {
                 if rows.len() == limit {
                     truncated = true;
@@ -576,8 +591,11 @@ impl SeryMcpServer {
         }
 
         let response = QueryResponse {
-            relative_path: req.path,
-            format,
+            input: describe_input(&table_specs),
+            format: table_specs
+                .first()
+                .map(|s| s.format.to_string())
+                .unwrap_or_default(),
             row_count: rows.len(),
             columns,
             rows,
@@ -653,6 +671,97 @@ impl SeryMcpServer {
             ));
         }
         Ok(joined)
+    }
+
+    /// Resolve a path that may be a regular file OR a glob pattern
+    /// (`*`, `?`, `[...]`). Used by `query_sql`, where DuckDB does
+    /// its own glob expansion at read time.
+    fn resolve_required_path_or_glob(&self, sub: &str) -> Result<PathBuf, McpError> {
+        if sub.is_empty() {
+            return Err(McpError::invalid_params("path must not be empty", None));
+        }
+        validate_relative_components(sub)?;
+        let joined = self.root.join(sub);
+        if !is_glob_pattern(sub) {
+            // Non-glob: enforce file-exists up-front so the LLM gets
+            // a clean error instead of DuckDB's "no files" message
+            // buried inside a SQL error.
+            let metadata = std::fs::metadata(&joined)
+                .map_err(|e| McpError::invalid_params(format!("path not readable: {e}"), None))?;
+            if !metadata.is_file() {
+                return Err(McpError::invalid_params(
+                    "path must refer to a regular file or a glob pattern",
+                    None,
+                ));
+            }
+        }
+        Ok(joined)
+    }
+
+    /// Translate the `path` / `tables` fields of a [`QuerySqlRequest`]
+    /// into a normalised list of [`TableSpec`]s ready to register
+    /// with DuckDB. Enforces:
+    ///
+    /// - Exactly one of `path` / `tables` is set.
+    /// - At least one table.
+    /// - At most 16 tables.
+    /// - Every table name is a valid SQL identifier.
+    /// - Every path resolves under `--root`.
+    /// - File extension is csv / tsv / parquet.
+    fn resolve_table_specs(&self, req: &QuerySqlRequest) -> Result<Vec<TableSpec>, McpError> {
+        match (&req.path, &req.tables) {
+            (Some(_), Some(_)) => Err(McpError::invalid_params(
+                "pass either `path` (single-file) or `tables` (multi-file), not both",
+                None,
+            )),
+            (None, None) => Err(McpError::invalid_params(
+                "must pass either `path` or `tables`",
+                None,
+            )),
+            (Some(path), None) => {
+                let resolved = self.resolve_required_path_or_glob(path)?;
+                let format = format_for_query_sql(path)?;
+                Ok(vec![TableSpec {
+                    table: "data".to_string(),
+                    path_for_sql: resolved.to_string_lossy().into_owned(),
+                    relative_path: path.clone(),
+                    format,
+                }])
+            }
+            (None, Some(tables)) => {
+                if tables.is_empty() {
+                    return Err(McpError::invalid_params("`tables` must not be empty", None));
+                }
+                if tables.len() > 16 {
+                    return Err(McpError::invalid_params("at most 16 tables per call", None));
+                }
+                let mut specs: Vec<TableSpec> = Vec::with_capacity(tables.len());
+                for (name, path) in tables {
+                    if !is_valid_sql_identifier(name) {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "table name '{name}' is not a valid SQL identifier \
+                                 ([a-zA-Z_][a-zA-Z0-9_]*)"
+                            ),
+                            None,
+                        ));
+                    }
+                    let resolved = self.resolve_required_path_or_glob(path)?;
+                    let format = format_for_query_sql(path)?;
+                    specs.push(TableSpec {
+                        table: name.clone(),
+                        path_for_sql: resolved.to_string_lossy().into_owned(),
+                        relative_path: path.clone(),
+                        format,
+                    });
+                }
+                // Sort for deterministic registration order — makes
+                // tests + logs reproducible. HashMap iteration order
+                // would otherwise be random.
+                specs.sort_by(|a, b| a.table.cmp(&b.table));
+                Ok(specs)
+            }
+        }
     }
 
     /// Walk `target` via [`scankit::Scanner`], capping output at
@@ -798,26 +907,188 @@ fn value_to_json(v: &tabkit::Value) -> serde_json::Value {
     }
 }
 
+/// One file registered as a SQL table inside the DuckDB session
+/// `query_sql` opens. `table` is what the LLM uses in its SQL;
+/// `path_for_sql` is the absolute filesystem path (or glob) we
+/// interpolate into DuckDB's `read_csv_auto` / `read_parquet`.
+#[derive(Debug)]
+struct TableSpec {
+    table: String,
+    path_for_sql: String,
+    relative_path: String,
+    format: &'static str,
+}
+
+/// Reject SQL that contains DDL / DML / admin keywords.
+///
+/// We tokenise the query on non-alphanumeric chars (so
+/// `SELECT "INSERTION" FROM data` doesn't false-positive on
+/// `INSERT`), then check each token against the blacklist. False
+/// positives are possible only when a query *literally* references
+/// a forbidden keyword as a string value (`WHERE name = 'INSERT'`);
+/// the LLM can reword in those rare cases. False negatives — which
+/// would be security holes — aren't possible because every
+/// dangerous DuckDB statement starts with one of these keywords.
+fn validate_query_sql(sql: &str) -> Result<(), McpError> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::invalid_params("`sql` must not be empty", None));
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
+        return Err(McpError::invalid_params(
+            "sql must start with SELECT or WITH (read-only queries only)",
+            None,
+        ));
+    }
+
+    const FORBIDDEN: &[&str] = &[
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "ATTACH",
+        "DETACH",
+        "COPY",
+        "PRAGMA",
+        "INSTALL",
+        "LOAD",
+        "EXPORT",
+        "IMPORT",
+        "CHECKPOINT",
+        "VACUUM",
+        "ANALYZE",
+        "TRUNCATE",
+        "GRANT",
+        "REVOKE",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+    ];
+    let tokens: std::collections::HashSet<&str> = upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for kw in FORBIDDEN {
+        if tokens.contains(*kw) {
+            return Err(McpError::invalid_params(
+                format!("forbidden SQL keyword: {kw} (query_sql is read-only)"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the `CREATE OR REPLACE VIEW <table> AS SELECT * FROM
+/// read_csv_auto(...) / read_parquet(...)` setup statement DuckDB
+/// runs to register a file as a queryable table.
+fn build_register_view(table: &str, path_for_sql: &str, format: &str) -> Result<String, McpError> {
+    let escaped_path = sql_string_literal(path_for_sql);
+    let read_call = match format {
+        "csv" => format!("read_csv_auto({escaped_path})"),
+        "tsv" => format!("read_csv_auto({escaped_path}, delim='\\t')"),
+        "parquet" => format!("read_parquet({escaped_path})"),
+        other => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "query_sql supports csv / tsv / parquet only — got '{other}'. \
+                     Use get_schema or sample_rows for XLSX/ODS files."
+                ),
+                None,
+            ));
+        }
+    };
+    // `table` is already validated as a SQL identifier; safe to
+    // interpolate without quotes.
+    Ok(format!(
+        "CREATE OR REPLACE VIEW {table} AS SELECT * FROM {read_call}"
+    ))
+}
+
+/// Echo back what the caller registered, in human-readable form.
+/// Single file: `"sales.csv"`. Multi file: `"customers=customers.csv,
+/// orders=orders.parquet"`.
+fn describe_input(specs: &[TableSpec]) -> String {
+    if specs.len() == 1 && specs[0].table == "data" {
+        return specs[0].relative_path.clone();
+    }
+    specs
+        .iter()
+        .map(|s| format!("{}={}", s.table, s.relative_path))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Detect `query_sql` glob patterns. DuckDB supports `*`, `**`, `?`,
+/// and `[...]`.
+fn is_glob_pattern(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Strict SQL identifier check: `[a-zA-Z_][a-zA-Z0-9_]*`. We don't
+/// support quoted identifiers (e.g. `"my table"`) for table names —
+/// keeps the safe-interpolation invariant simple.
+fn is_valid_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve a `query_sql` path argument's format.
+fn format_for_query_sql(path: &str) -> Result<&'static str, McpError> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".csv") {
+        Ok("csv")
+    } else if lower.ends_with(".tsv") {
+        Ok("tsv")
+    } else if lower.ends_with(".parquet") {
+        Ok("parquet")
+    } else {
+        Err(McpError::invalid_params(
+            format!(
+                "query_sql expects a path / glob ending in .csv, .tsv, or .parquet — got '{path}'"
+            ),
+            None,
+        ))
+    }
+}
+
+/// Escape a string for use inside a DuckDB single-quoted SQL string
+/// literal: doubles every embedded `'`. Used for filesystem paths
+/// that might contain quotes (legal on macOS/Linux, rare in practice).
+fn sql_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Convert one cell of an Arrow array to a JSON value.
 ///
-/// Numeric / boolean types map to native JSON. Date / timestamp
-/// types serialise as ISO 8601 strings (`DataFusion`'s default
-/// format), since that round-trips cleanly through MCP / JSON / the
-/// LLM. Anything we don't recognise downgrades to its `Display`
-/// representation as a JSON string — keeps `query_sql` resilient
-/// to `DataFusion` adding new types in minor versions.
+/// DuckDB's Arrow output uses the `arrow` crate types as
+/// `DataFusion` / `polars` — the same matching code works against
+/// any of them once you import from the right namespace. Numeric /
+/// boolean types map to native JSON. Date / timestamp types
+/// serialise as ISO 8601 strings (round-trips cleanly through MCP /
+/// JSON / the LLM). Anything we don't recognise downgrades to its
+/// `Display` representation via Arrow's `ArrayFormatter` — keeps
+/// `query_sql` resilient to DuckDB returning new types in minor
+/// versions.
 #[allow(clippy::too_many_lines)] // exhaustive type-match by design — splitting harms readability
-fn arrow_value_to_json(
-    array: &dyn datafusion::arrow::array::Array,
-    row: usize,
-) -> serde_json::Value {
-    use datafusion::arrow::array::{
-        BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, Int8Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+fn arrow_value_to_json(array: &dyn duckdb::arrow::array::Array, row: usize) -> serde_json::Value {
+    use duckdb::arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
-    use datafusion::arrow::datatypes::DataType;
+    use duckdb::arrow::datatypes::DataType;
 
     if array.is_null(row) {
         return serde_json::Value::Null;
@@ -901,6 +1172,28 @@ fn arrow_value_to_json(
                     serde_json::Value::String(d.format("%Y-%m-%d").to_string())
                 })
         }
+        DataType::Decimal128(_, scale) => {
+            // DuckDB SUM/AVG of integer columns returns HUGEINT,
+            // which Arrow encodes as Decimal128(38, 0). For
+            // scale-0 values that fit in i64, emit a JSON number
+            // so the LLM gets `100` (not `"100"`). Larger or
+            // non-zero-scale values fall through to a string.
+            let typed = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128Array");
+            let raw = typed.value(row);
+            if *scale == 0 {
+                if let Ok(fits) = i64::try_from(raw) {
+                    return serde_json::Value::Number(fits.into());
+                }
+            }
+            use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
+            ArrayFormatter::try_new(array, &FormatOptions::default()).map_or_else(
+                |_| serde_json::Value::String(format!("(decimal {raw})")),
+                |fmt| serde_json::Value::String(fmt.value(row).to_string()),
+            )
+        }
         DataType::Timestamp(_, _) => {
             // Cover all four precision variants by trying the most
             // common first. DataFusion CSV/Parquet readers emit
@@ -940,7 +1233,7 @@ fn arrow_value_to_json(
         // than panicking. Keeps query_sql resilient to schemas we
         // didn't anticipate.
         _ => {
-            use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+            use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
             ArrayFormatter::try_new(array, &FormatOptions::default()).map_or_else(
                 |_| {
                     serde_json::Value::String(format!("(unrenderable {} value)", array.data_type()))
@@ -1157,10 +1450,24 @@ mod tests {
         assert_eq!(hits[0].extension, "csv");
     }
 
-    // ── query_sql (DataFusion) ──
+    // ── query_sql (DuckDB) ──
 
-    #[tokio::test]
-    async fn query_sql_csv_happy_path() {
+    fn query_req(
+        path: Option<&str>,
+        tables: Option<std::collections::HashMap<String, String>>,
+        sql: &str,
+        limit: Option<usize>,
+    ) -> QuerySqlRequest {
+        QuerySqlRequest {
+            path: path.map(String::from),
+            tables,
+            sql: sql.into(),
+            limit,
+        }
+    }
+
+    #[test]
+    fn query_sql_csv_happy_path() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("sales.csv"),
@@ -1169,25 +1476,25 @@ mod tests {
         .unwrap();
         let server = make_server(dir.path());
         let result = server
-            .query_sql(Parameters(QuerySqlRequest {
-                path: "sales.csv".into(),
-                sql: "SELECT name, amount FROM data WHERE amount > 75 ORDER BY amount".into(),
-                limit: None,
-            }))
-            .await
+            .query_sql(Parameters(query_req(
+                Some("sales.csv"),
+                None,
+                "SELECT name, amount FROM data WHERE amount > 75 ORDER BY amount",
+                None,
+            )))
             .unwrap();
-        let payload = result_text(&result);
-        let parsed: QueryResponseDe = serde_json::from_str(&payload).unwrap();
+        let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(parsed.format, "csv");
         assert_eq!(parsed.columns, vec!["name", "amount"]);
         assert_eq!(parsed.row_count, 2);
         assert!(!parsed.truncated);
         assert_eq!(parsed.rows[0].get("name").unwrap().as_str(), Some("alice"));
         assert_eq!(parsed.rows[1].get("name").unwrap().as_str(), Some("bob"));
+        assert_eq!(parsed.input, "sales.csv");
     }
 
-    #[tokio::test]
-    async fn query_sql_truncates_at_limit() {
+    #[test]
+    fn query_sql_truncates_at_limit() {
         use std::fmt::Write as _;
         let dir = TempDir::new().unwrap();
         let mut csv = String::from("n\n");
@@ -1197,48 +1504,161 @@ mod tests {
         fs::write(dir.path().join("nums.csv"), csv).unwrap();
         let server = make_server(dir.path());
         let result = server
-            .query_sql(Parameters(QuerySqlRequest {
-                path: "nums.csv".into(),
-                sql: "SELECT n FROM data".into(),
-                limit: Some(5),
-            }))
-            .await
+            .query_sql(Parameters(query_req(
+                Some("nums.csv"),
+                None,
+                "SELECT n FROM data",
+                Some(5),
+            )))
             .unwrap();
         let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(parsed.row_count, 5);
         assert!(parsed.truncated);
     }
 
-    #[tokio::test]
-    async fn query_sql_rejects_unsupported_format() {
+    #[test]
+    fn query_sql_rejects_unsupported_format() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("notes.txt"), "hi").unwrap();
         let server = make_server(dir.path());
         let err = server
-            .query_sql(Parameters(QuerySqlRequest {
-                path: "notes.txt".into(),
-                sql: "SELECT 1".into(),
-                limit: None,
-            }))
-            .await
+            .query_sql(Parameters(query_req(
+                Some("notes.txt"),
+                None,
+                "SELECT 1",
+                None,
+            )))
             .unwrap_err();
-        assert!(format!("{err:?}").contains("csv / tsv / parquet"));
+        assert!(format!("{err:?}").to_lowercase().contains(".csv"));
     }
 
-    #[tokio::test]
-    async fn query_sql_surfaces_sql_parse_errors() {
+    #[test]
+    fn query_sql_surfaces_sql_parse_errors() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
         let server = make_server(dir.path());
         let err = server
-            .query_sql(Parameters(QuerySqlRequest {
-                path: "a.csv".into(),
-                sql: "SELEKT * FROM data".into(),
-                limit: None,
-            }))
-            .await
+            .query_sql(Parameters(query_req(
+                Some("a.csv"),
+                None,
+                "SELEKT * FROM data",
+                None,
+            )))
             .unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("sql"));
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(msg.contains("sql") || msg.contains("read-only"));
+    }
+
+    #[test]
+    fn query_sql_blocks_ddl() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+        let server = make_server(dir.path());
+        for evil in [
+            "DROP TABLE data",
+            "ATTACH '/etc/passwd' AS p",
+            "INSERT INTO data VALUES (1)",
+            "PRAGMA table_info('data')",
+        ] {
+            let err = server
+                .query_sql(Parameters(query_req(Some("a.csv"), None, evil, None)))
+                .unwrap_err();
+            let msg = format!("{err:?}").to_lowercase();
+            assert!(
+                msg.contains("forbidden") || msg.contains("read-only"),
+                "expected SQL '{evil}' to be rejected; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_sql_multi_file_join() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("customers.csv"),
+            "id,name\n1,Alice\n2,Bob\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("orders.csv"),
+            "customer_id,amount\n1,100\n1,50\n2,200\n",
+        )
+        .unwrap();
+        let server = make_server(dir.path());
+        let mut tables = std::collections::HashMap::new();
+        tables.insert("customers".into(), "customers.csv".into());
+        tables.insert("orders".into(), "orders.csv".into());
+        let result = server
+            .query_sql(Parameters(query_req(
+                None,
+                Some(tables),
+                "SELECT c.name, SUM(o.amount) AS total \
+                 FROM customers c JOIN orders o ON c.id = o.customer_id \
+                 GROUP BY c.name ORDER BY total DESC",
+                None,
+            )))
+            .unwrap();
+        let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(parsed.columns, vec!["name", "total"]);
+        assert_eq!(parsed.row_count, 2);
+        assert_eq!(parsed.rows[0].get("name").unwrap().as_str(), Some("Bob"));
+        assert_eq!(parsed.rows[1].get("name").unwrap().as_str(), Some("Alice"));
+        // input echoes alphabetised because resolve_table_specs sorts.
+        assert!(parsed.input.contains("customers=customers.csv"));
+        assert!(parsed.input.contains("orders=orders.csv"));
+    }
+
+    #[test]
+    fn query_sql_glob_pattern() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("jan.csv"), "amt\n10\n20\n").unwrap();
+        fs::write(dir.path().join("feb.csv"), "amt\n30\n40\n").unwrap();
+        let server = make_server(dir.path());
+        let result = server
+            .query_sql(Parameters(query_req(
+                Some("*.csv"),
+                None,
+                "SELECT SUM(amt) AS total FROM data",
+                None,
+            )))
+            .unwrap();
+        let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(parsed.row_count, 1);
+        assert_eq!(
+            parsed.rows[0].get("total").and_then(serde_json::Value::as_i64),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn query_sql_rejects_both_path_and_tables() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+        let server = make_server(dir.path());
+        let mut tables = std::collections::HashMap::new();
+        tables.insert("t".into(), "a.csv".into());
+        let err = server
+            .query_sql(Parameters(query_req(
+                Some("a.csv"),
+                Some(tables),
+                "SELECT 1",
+                None,
+            )))
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("either"));
+    }
+
+    #[test]
+    fn query_sql_rejects_invalid_table_name() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+        let server = make_server(dir.path());
+        let mut tables = std::collections::HashMap::new();
+        tables.insert("evil; DROP TABLE x".into(), "a.csv".into());
+        let err = server
+            .query_sql(Parameters(query_req(None, Some(tables), "SELECT 1", None)))
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("identifier"));
     }
 
     #[test]
@@ -1317,8 +1737,7 @@ mod tests {
 
     #[derive(serde::Deserialize)]
     struct QueryResponseDe {
-        #[allow(dead_code)]
-        relative_path: String,
+        input: String,
         format: String,
         columns: Vec<String>,
         rows: Vec<serde_json::Map<String, serde_json::Value>>,

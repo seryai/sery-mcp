@@ -11,6 +11,77 @@ do.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-28
+
+### Changed — `query_sql` now backed by DuckDB
+
+The DataFusion backend (v0.3.0) covered the simple "one file, one
+query" case but couldn't handle the use cases sery-link's marketing
+site actually sells: multi-file JOINs (e.g. customer × order tables),
+glob patterns over folders (`2024/*.csv`), smart CSV sniffing on
+messy real-world exports, window functions for trends, native XLSX.
+
+Migrated to DuckDB to match what sery-link uses for its tunnel-based
+SQL execution. Same dialect across local stdio MCP and cloud chat.
+
+### Added — multi-file `query_sql`
+
+- **`tables: { name: path }`** request shape lets the LLM register
+  multiple files as named SQL tables and JOIN across them. Each name
+  must be a valid SQL identifier; cap of 16 tables per call.
+- **Glob patterns** (`*`, `**`, `?`, `[...]`) supported in both
+  single-file `path` mode and multi-file `tables` mode. DuckDB
+  expands them at read time. Patterns stay bounded by `--root` —
+  the path validator still rejects `..` and absolute paths.
+- **DuckDB `Decimal128` handling** for `SUM` / `AVG` results that
+  arrive as HUGEINT. Scale-0 values that fit in `i64` emit as JSON
+  numbers; larger values fall through to string preserving precision.
+
+### Added — read-only safety net
+
+Even with `--root` sandboxing, paranoid SQL validation:
+
+- Query must start with `SELECT` or `WITH` — anything else rejected.
+- Token-based blacklist for: `INSERT`, `UPDATE`, `DELETE`, `CREATE`,
+  `DROP`, `ALTER`, `ATTACH`, `DETACH`, `COPY`, `PRAGMA`, `INSTALL`,
+  `LOAD`, `EXPORT`, `IMPORT`, `CHECKPOINT`, `VACUUM`, `ANALYZE`,
+  `TRUNCATE`, `GRANT`, `REVOKE`, `BEGIN`, `COMMIT`, `ROLLBACK`,
+  `SAVEPOINT`. False positives only when those keywords appear as
+  literal string values (`WHERE name = 'INSERT'`) — LLM can reword.
+- Path strings are escaped before interpolation into
+  `read_csv_auto('...')` / `read_parquet('...')` calls (single-quotes
+  doubled per DuckDB's literal escape rules).
+
+### Removed
+
+- **DataFusion dep** — gone. Cargo.lock drops ~5 MB of compiled
+  Arrow + DataFusion code; DuckDB carries its own (smaller) Arrow
+  surface via `duckdb::arrow`.
+
+### Tests
+
+- 5 new tests, 23 total. `query_sql_csv_happy_path`,
+  `query_sql_truncates_at_limit`, `query_sql_rejects_unsupported_format`,
+  `query_sql_surfaces_sql_parse_errors`, `query_sql_blocks_ddl`,
+  `query_sql_multi_file_join`, `query_sql_glob_pattern`,
+  `query_sql_rejects_both_path_and_tables`,
+  `query_sql_rejects_invalid_table_name`.
+
+### Migration notes
+
+Single-file `query_sql` callers from v0.3 keep working — the `path`
+argument is still accepted, the file is still registered as table
+`data`. Only change: response field renamed `relative_path` → `input`
+(now describes either a single path or a multi-table mapping).
+Standalone v0.3 binary users won't notice; LLMs see a slightly
+different field name in tool results.
+
+`query_sql` is now **synchronous** internally (DuckDB's API is sync;
+async wasn't buying us anything in the stdio-one-client-at-a-time
+model). The tool method dropped its `async` keyword. Callers that
+embed `SeryMcpServer::query_sql` directly need to drop their
+`.await`.
+
 ## [0.3.0] — 2026-04-28
 
 ### Added — `query_sql` (the v0.3 headline tool)

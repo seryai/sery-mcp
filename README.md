@@ -2,7 +2,7 @@
 
 **The local-files MCP server. Pure Rust. Free your Claude Desktop / Cursor / Zed / Continue from the upload-to-cloud dance.**
 
-> **Status:** v0.3.0 — all six planned tools shipped: `list_folder`, `search_files`, `get_schema`, `sample_rows`, `read_document`, `query_sql`.
+> **Status:** v0.4.0 — DuckDB-backed `query_sql` (multi-file JOINs, glob patterns, smart CSV sniffing), library-first packaging so other Rust crates can embed the same tool surface.
 
 `sery-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that exposes the data-heavy files on your machine — CSVs,
@@ -58,7 +58,7 @@ Restart your MCP client and the tools below show up in its tool palette.
 | `get_schema` | Column names + inferred types + row count for any tabular file (CSV / TSV / Parquet / XLSX / XLS / XLSB / XLSM / ODS) | `tabkit` |
 | `sample_rows` | First N rows of a tabular file as header-keyed JSON objects (default 5, capped at 100) | `tabkit` |
 | `read_document` | DOCX / PDF / PPTX / HTML / IPYNB / EPUB / RTF / ODT → markdown. 50 MB cap. | `mdkit` (libpdfium / pandoc / html2md) |
-| `query_sql` | Read-only SQL on a CSV / TSV / Parquet file. The file is registered as table `data` for the duration of the call. Row cap default 100, max 1000. | `DataFusion` |
+| `query_sql` | Read-only SQL on **one or more** CSV / TSV / Parquet files. Single-file: pass `path`, reference as table `data`. Multi-file: pass `tables: { name → path }`, JOIN them. Glob patterns supported. Row cap default 100, max 1000. | `DuckDB` |
 
 Tools are **read-only** by design. There is no `write_file`, no
 `execute_command`, no `delete`. `query_sql` rejects INSERT / UPDATE
@@ -100,7 +100,7 @@ in the LLM (or in your prompt) cannot lose your data.
 │  │  ├─ get_schema     →  tabkit            │    │
 │  │  ├─ sample_rows    →  tabkit            │    │
 │  │  ├─ read_document  →  mdkit             │    │
-│  │  └─ query_sql      →  DataFusion        │    │
+│  │  └─ query_sql      →  DuckDB            │    │
 │  └─────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────┘
                      │ filesystem reads
