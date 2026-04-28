@@ -30,7 +30,7 @@
 //! filesystem call. Tools are read-only by design — no `write_file`,
 //! no `delete`, no `execute`.
 
-#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.1")]
+#![doc(html_root_url = "https://docs.rs/sery-mcp/0.4.2")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Pedantic lints we deliberately accept:
 //   * doc_markdown — prose mentions SQL keywords, library names, and

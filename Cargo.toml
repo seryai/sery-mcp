@@ -1,6 +1,6 @@
 [package]
 name = "sery-mcp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 # 1.88 because mdkit transitively pulls in libloading 0.9 (via
 # pdfium-render) which sets rust-version = "1.88". Same floor as the

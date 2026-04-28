@@ -11,6 +11,21 @@ do.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-04-28
+
+### Fixed — Windows linker error
+
+The bundled SQL engine's C++ source references the Windows Restart
+Manager APIs (`RmStartSession` / `RmEndSession` /
+`RmRegisterResources` / `RmGetList`) without instructing cargo to
+link `Rstrtmgr.lib`. The resulting `link.exe` invocation hit
+LNK2019 unresolved-external-symbol errors on every Windows build.
+
+Add a `build.rs` that emits `cargo:rustc-link-lib=Rstrtmgr` only on
+the Windows target. Linux + macOS builds are unchanged. Existing
+sery-link installs (which inherit the same dep tree) get the fix
+transitively when they bump to this version.
+
 ## [0.4.1] — 2026-04-28
 
 ### Changed — docs polish
