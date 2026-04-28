@@ -1626,7 +1626,9 @@ mod tests {
         let parsed: QueryResponseDe = serde_json::from_str(&result_text(&result)).unwrap();
         assert_eq!(parsed.row_count, 1);
         assert_eq!(
-            parsed.rows[0].get("total").and_then(serde_json::Value::as_i64),
+            parsed.rows[0]
+                .get("total")
+                .and_then(serde_json::Value::as_i64),
             Some(100)
         );
     }
