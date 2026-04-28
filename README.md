@@ -56,7 +56,7 @@ Restart your MCP client and the tools below show up in its tool palette.
 | `list_folder` | Enumerate files under a folder, with size + mtime + extension | `scankit` |
 | `search_files` | Find files by name + extension, ranked | `scankit` + lightweight scoring |
 | `get_schema` | Return column names + types + row count for a tabular file | `tabkit` |
-| `query_sql` | Run a SQL query against a local tabular file | DuckDB (transient in-memory) |
+| `query_sql` | Run a SQL query against a local tabular file | Pure-Rust SQL engine (DataFusion / Polars — TBD in v0.1) |
 | `read_document` | Convert a document to markdown for the LLM to read | `mdkit` |
 | `sample_rows` | Return N sample rows from a tabular file (PII-redacted) | `tabkit` |
 
@@ -97,7 +97,7 @@ the LLM (or in your prompt) cannot lose your data.
 │  │  ├─ list_folder    →  scankit           │    │
 │  │  ├─ search_files   →  scankit           │    │
 │  │  ├─ get_schema     →  tabkit            │    │
-│  │  ├─ query_sql      →  DuckDB            │    │
+│  │  ├─ query_sql      →  pure-Rust SQL     │    │
 │  │  ├─ read_document  →  mdkit             │    │
 │  │  └─ sample_rows    →  tabkit            │    │
 │  └─────────────────────────────────────────┘    │
