@@ -13,7 +13,7 @@ homepage = "https://github.com/seryai/sery-mcp"
 repository = "https://github.com/seryai/sery-mcp"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "anthropic", "filesystem", "indexer"]
+keywords = ["mcp", "mcp-server", "anthropic", "filesystem", "indexer"]
 categories = ["command-line-utilities", "filesystem", "development-tools"]
 exclude = [
     "/.github",
