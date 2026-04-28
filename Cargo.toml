@@ -1,0 +1,91 @@
+[package]
+name = "sery-mcp"
+version = "0.0.1"
+edition = "2021"
+# 1.88 because mdkit transitively pulls in libloading 0.9 (via
+# pdfium-render) which sets rust-version = "1.88". Same floor as the
+# rest of the kit family's dep tree.
+rust-version = "1.88"
+authors = ["Sery.ai <hello@sery.ai>"]
+description = "The local-files MCP server. Pure Rust. Exposes CSVs, Parquet, Excel, DOCX, PDF, and HTML on the user's machine to any MCP-aware LLM client (Claude Desktop, Cursor, Zed, …)."
+documentation = "https://docs.rs/sery-mcp"
+homepage = "https://github.com/seryai/sery-mcp"
+repository = "https://github.com/seryai/sery-mcp"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "anthropic", "filesystem", "indexer"]
+categories = ["command-line-utilities", "filesystem", "development-tools"]
+exclude = [
+    "/.github",
+]
+
+# Binary-first crate. The library surface stays minimal and is only
+# exposed for downstream consumers that want to embed sery-mcp's tool
+# implementations into their own MCP server (rare).
+[[bin]]
+name = "sery-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "sery_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+# rmcp — the official Anthropic Rust SDK for Model Context Protocol.
+# Pinned to ^1.5 because v1.x marks the post-1.0 stable surface; minor
+# bumps are additive per the SDK's own SemVer policy. Default features
+# (base64, macros, server) cover the stdio server case we need; the
+# `client`, `auth`, and `reqwest` features stay off so we don't drag in
+# HTTP machinery for a stdio-only binary.
+rmcp = "1.5"
+
+# Sery kit family — the file-extraction backends. See the README's
+# architecture diagram for which tool wires to which kit.
+scankit = "0.3"
+tabkit = { version = "0.4", features = ["parquet"] }
+mdkit = { version = "0.7", features = ["pandoc", "ocr-platform"] }
+
+# Async runtime. tokio is rmcp's required runtime; "rt-multi-thread" +
+# "io-std" + "macros" cover the stdio server use case.
+tokio = { version = "1.35", features = ["rt-multi-thread", "io-std", "macros"] }
+
+# Serde for tool input/output schemas. rmcp re-exports serde_json but
+# we use serde_derive on our own tool types so a direct dep keeps the
+# derives discoverable.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling. thiserror for the few error types the library surface
+# exposes; anyhow for the binary's main() loop where we just want to
+# surface a clean message to stderr.
+thiserror = "2"
+anyhow = "1"
+
+# Structured logging via tracing — rmcp uses tracing internally, and
+# routing our own logs through the same crate keeps everything in one
+# stream. Subscriber writes to stderr (NEVER stdout — stdout is the
+# MCP transport channel).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI parsing. clap is the obvious choice; the "derive" feature is
+# enough — we only need a handful of flags (--root, --version, etc.).
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# `forbid` rather than `deny` — there's no FFI in this crate (the kits
+# handle that), so any `unsafe` block here is a bug to fix at review
+# time rather than to allow with a comment.
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Selectively allow the pedantic lints that fight common idioms.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"

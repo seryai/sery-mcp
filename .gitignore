@@ -1,0 +1,19 @@
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Environment / secrets — sery-mcp itself doesn't take any, but examples
+# under examples/ might (e.g. demo MCP clients pointing at a folder).
+.env
+.env.*
+!.env.example
