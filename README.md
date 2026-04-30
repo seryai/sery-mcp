@@ -34,7 +34,12 @@ Rust SDK.
 cargo install sery-mcp
 ```
 
-Then point your MCP client at it. Example for Claude Desktop's `mcp.json`:
+Then add it to your MCP client's config. Pick yours below.
+
+### Claude Desktop
+
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```jsonc
 {
@@ -47,7 +52,66 @@ Then point your MCP client at it. Example for Claude Desktop's `mcp.json`:
 }
 ```
 
-Restart your MCP client and the tools below show up in its tool palette.
+### Warp ([went open-source 2026-04-28](https://www.warp.dev/blog/warp-is-now-open-source))
+
+In Warp: **Settings → AI → MCP Servers → + Add** and paste:
+
+```jsonc
+{
+  "mcpServers": {
+    "sery": {
+      "command": "sery-mcp",
+      "args": ["--root", "/Users/me/Documents"]
+    }
+  }
+}
+```
+
+(Warp accepts the same `mcpServers` JSON format as Claude Desktop and
+Cursor — same snippet works in all three. See the
+[Warp MCP docs](https://docs.warp.dev/agent-platform/capabilities/mcp)
+for the UI flow.)
+
+Then in any Warp prompt: *"find tax documents from 2024"* or
+*"sum the revenue column across every CSV in this folder"* — Oz
+agents call `sery-mcp`'s tools to read your local files; nothing
+uploads.
+
+### Cursor
+
+`~/.cursor/mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "sery": {
+      "command": "sery-mcp",
+      "args": ["--root", "/Users/me/Documents"]
+    }
+  }
+}
+```
+
+### Continue (VS Code / JetBrains)
+
+In `~/.continue/config.json` under `mcpServers`:
+
+```jsonc
+{
+  "mcpServers": [
+    {
+      "name": "sery",
+      "transport": {
+        "type": "stdio",
+        "command": "sery-mcp",
+        "args": ["--root", "/Users/me/Documents"]
+      }
+    }
+  ]
+}
+```
+
+Restart your client. The tools below show up in its tool palette.
 
 ## Tool surface (v0.3.0 — feature-complete)
 
