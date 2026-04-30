@@ -11,6 +11,22 @@ do.
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-04-30
+
+### Changed
+
+- Documentation-only release. README's "Quick start" section
+  expanded to cover **Claude Desktop**, **Warp**, **Cursor**,
+  and **Continue** — all four MCP clients accept the same
+  `mcpServers` JSON snippet, so the only thing that varies between
+  them is where you paste it. [Warp open-sourced its terminal
+  under AGPL-3.0 on 2026-04-28](https://www.warp.dev/blog/warp-is-now-open-source);
+  this release ensures `sery-mcp`'s install instructions are visible
+  to that audience while the launch is fresh.
+
+No code or behavior changes; existing v0.4.3 installs need not
+upgrade.
+
 ## [0.4.3] — 2026-04-28
 
 ### Fixed — two Windows-specific bugs surfaced by CI
